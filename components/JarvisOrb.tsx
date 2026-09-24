@@ -3,8 +3,36 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { createOrbScene, type OrbSceneApi } from "@/lib/orbScene";
 import { HandTracker, type TrackerStatus } from "@/lib/handTracker";
+import {
+  hasWakeWord,
+  openSafeTarget,
+  parseVoiceCommand,
+  speak,
+  stripWakeWord,
+  type VoiceCommand,
+} from "@/lib/voiceCommands";
 
 type CameraState = "off" | "starting" | "on" | "error";
+type VoiceState = "off" | "starting" | "waiting" | "active" | "error";
+type SpeechEvent = { results: ArrayLike<{ 0: { transcript: string }; length: number }> };
+type Recognition = {
+  continuous: boolean;
+  interimResults: boolean;
+  lang: string;
+  onresult: ((event: SpeechEvent) => void) | null;
+  onerror: ((event: { error: string }) => void) | null;
+  onend: (() => void) | null;
+  start: () => void;
+  stop: () => void;
+};
+type RecognitionConstructor = new () => Recognition;
+
+declare global {
+  interface Window {
+    SpeechRecognition?: RecognitionConstructor;
+    webkitSpeechRecognition?: RecognitionConstructor;
+  }
+}
 
 const MODE_LABEL: Record<TrackerStatus["mode"], string> = {
   idle: "STANDBY",
@@ -18,22 +46,35 @@ export default function JarvisOrb() {
   const overlayRef = useRef<HTMLCanvasElement>(null);
   const sceneRef = useRef<OrbSceneApi | null>(null);
   const trackerRef = useRef<HandTracker | null>(null);
+  const recognitionRef = useRef<Recognition | null>(null);
+  const voiceRunningRef = useRef(false);
+  const listeningForCommandRef = useRef(false);
 
   const [camera, setCamera] = useState<CameraState>("off");
   const [status, setStatus] = useState<TrackerStatus>({ hands: 0, mode: "idle" });
   const [error, setError] = useState<string | null>(null);
+  const [voice, setVoice] = useState<VoiceState>("off");
+  const [lastTranscript, setLastTranscript] = useState("");
 
   useEffect(() => {
     const container = containerRef.current;
     if (!container) return;
-    const scene = createOrbScene(container);
-    sceneRef.current = scene;
-    return () => {
-      trackerRef.current?.stop();
-      trackerRef.current = null;
-      scene.dispose();
-      sceneRef.current = null;
-    };
+
+    try {
+      const scene = createOrbScene(container);
+      sceneRef.current = scene;
+
+      return () => {
+        trackerRef.current?.stop();
+        recognitionRef.current?.stop();
+        scene.dispose();
+        sceneRef.current = null;
+      };
+    } catch (err) {
+      console.error("Unable to create ULTRON scene", err);
+      setError("3D DISPLAY FAILED — ENABLE WEBGL OR TRY CHROME");
+      return undefined;
+    }
   }, []);
 
   const stopGestures = useCallback(() => {
@@ -73,42 +114,148 @@ export default function JarvisOrb() {
     }
   }, []);
 
+  const runVoiceCommand = useCallback(
+    (transcript: string) => {
+      const command: VoiceCommand = parseVoiceCommand(transcript);
+
+      switch (command.type) {
+        case "open":
+          openSafeTarget(command.target);
+          speak(`Opening ${command.label}.`);
+          break;
+        case "zoom-in":
+          sceneRef.current?.zoomIn();
+          speak("Zooming in.");
+          break;
+        case "zoom-out":
+          sceneRef.current?.zoomOut();
+          speak("Zooming out.");
+          break;
+        case "reset":
+          sceneRef.current?.resetView();
+          speak("View reset.");
+          break;
+        case "gestures":
+          if (command.enabled && !trackerRef.current) void startGestures();
+          if (!command.enabled && trackerRef.current) stopGestures();
+          speak(command.enabled ? "Gestures enabled." : "Gestures disabled.");
+          break;
+        case "help":
+          speak("Say open Google, open YouTube, open Gmail, zoom in, zoom out, or reset.");
+          break;
+        default:
+          speak("I did not recognize that command.");
+      }
+    },
+    [startGestures, stopGestures],
+  );
+
+  const startVoice = useCallback(() => {
+    if (voiceRunningRef.current) return;
+    const Constructor = window.SpeechRecognition ?? window.webkitSpeechRecognition;
+    if (!Constructor) {
+      setVoice("error");
+      setError("VOICE RECOGNITION NEEDS CHROME OR EDGE");
+      return;
+    }
+
+    const recognition = new Constructor();
+    recognition.continuous = true;
+    recognition.interimResults = false;
+    recognition.lang = "en-US";
+
+    recognition.onresult = (event) => {
+      const result = event.results[event.results.length - 1];
+      const transcript = result[0].transcript.trim();
+      setLastTranscript(transcript);
+
+      if (!listeningForCommandRef.current) {
+        if (!hasWakeWord(transcript)) return;
+        listeningForCommandRef.current = true;
+        setVoice("active");
+
+        const commandText = stripWakeWord(transcript);
+        if (commandText) {
+          runVoiceCommand(commandText);
+          listeningForCommandRef.current = false;
+          setVoice("waiting");
+        } else {
+          speak("Yes, I am listening.");
+          listeningForCommandRef.current = false;
+          setVoice("waiting");
+        }
+        return;
+      }
+
+      runVoiceCommand(transcript);
+      listeningForCommandRef.current = false;
+      setVoice("waiting");
+    };
+
+    recognition.onerror = (event) => {
+      if (event.error !== "aborted" && event.error !== "no-speech") {
+        setError(`VOICE ERROR: ${event.error.toUpperCase()}`);
+      }
+    };
+
+    recognition.onend = () => {
+      if (voiceRunningRef.current) {
+        try {
+          recognition.start();
+        } catch {
+          // Restart is attempted again by the browser/browser-specific conditions.
+        }
+      }
+    };
+
+    recognitionRef.current = recognition;
+    voiceRunningRef.current = true;
+    setVoice("starting");
+    setError(null);
+
+    try {
+      recognition.start();
+      setVoice("waiting");
+      speak("Ultron is ready. Say Ultron, then a command.");
+    } catch {
+      voiceRunningRef.current = false;
+      setVoice("error");
+      setError("MICROPHONE START FAILED");
+    }
+  }, [runVoiceCommand]);
+
+  const stopVoice = useCallback(() => {
+    voiceRunningRef.current = false;
+    listeningForCommandRef.current = false;
+    recognitionRef.current?.stop();
+    recognitionRef.current = null;
+    setVoice("off");
+    setLastTranscript("");
+  }, []);
+
   const toggleGestures = useCallback(() => {
     if (trackerRef.current) stopGestures();
     else void startGestures();
   }, [startGestures, stopGestures]);
 
   useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
-      switch (e.key) {
-        case "+":
-        case "=":
-          sceneRef.current?.zoomIn();
-          break;
-        case "-":
-        case "_":
-          sceneRef.current?.zoomOut();
-          break;
-        case "r":
-        case "R":
-          sceneRef.current?.resetView();
-          break;
-        case "g":
-        case "G":
-          toggleGestures();
-          break;
-      }
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key === "=" || event.key === "+") sceneRef.current?.zoomIn();
+      else if (event.key === "-" || event.key === "_") sceneRef.current?.zoomOut();
+      else if (event.key.toLowerCase() === "r") sceneRef.current?.resetView();
+      else if (event.key.toLowerCase() === "g") toggleGestures();
     };
+
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   }, [toggleGestures]);
 
   const cameraOn = camera === "on";
+  const voiceOn = voice !== "off" && voice !== "error";
 
   return (
     <>
-      <div ref={containerRef} className="orb-root" />
-
+      <div ref={containerRef} className={`orb-root${voice === "active" ? " orb-awake" : ""}`} />
       <div className="overlay-vignette" />
       <div className="overlay-grain" />
       <div className="overlay-scanlines" />
@@ -120,23 +267,26 @@ export default function JarvisOrb() {
           <span className="key">DRAG</span> spin&nbsp;&nbsp;
           <span className="key">SCROLL</span> zoom
         </div>
-        {cameraOn ? (
-          <div>
-            <span className="key">PINCH + MOVE</span> spin&nbsp;&nbsp;
-            <span className="key">PINCH BOTH HANDS ± SPREAD</span> zoom
-          </div>
-        ) : (
-          <div>
-            <span className="key">G</span> hand gestures&nbsp;&nbsp;
-            <span className="key">R</span> reset&nbsp;&nbsp;
-            <span className="key">+/−</span> zoom
-          </div>
-        )}
+        <div>
+          <span className="key">G</span> gestures&nbsp;&nbsp;
+          <span className="key">R</span> reset&nbsp;&nbsp;
+          <span className="key">+/−</span> zoom
+        </div>
       </div>
 
       <div className="hud hud-controls">
+        <div className={`voice-panel${voiceOn ? " visible" : ""}`}>
+          <div className="voice-status">
+            {voice === "active"
+              ? "ULTRON ACTIVE · LISTENING"
+              : voice === "starting"
+                ? "INITIALIZING VOICE…"
+                : "SAY ULTRON TO ACTIVATE"}
+          </div>
+          {lastTranscript && <div className="voice-transcript">“{lastTranscript}”</div>}
+        </div>
+
         <div className={`camera-panel${cameraOn ? " visible" : ""}`}>
-          {/* Mirrored preview so it behaves like a mirror */}
           <video ref={videoRef} muted playsInline className="camera-video" />
           <canvas ref={overlayRef} width={208} height={156} className="camera-overlay" />
           <div className="camera-status">
@@ -152,6 +302,14 @@ export default function JarvisOrb() {
           <button
             type="button"
             className="hud-btn"
+            aria-pressed={voiceOn}
+            onClick={voiceOn ? stopVoice : startVoice}
+          >
+            {voiceOn ? "VOICE ON" : "ACTIVATE VOICE"}
+          </button>
+          <button
+            type="button"
+            className="hud-btn"
             aria-pressed={cameraOn}
             onClick={toggleGestures}
             disabled={camera === "starting"}
@@ -159,6 +317,7 @@ export default function JarvisOrb() {
             {camera === "starting" ? "INITIALIZING…" : cameraOn ? "GESTURES ON" : "GESTURES OFF"}
           </button>
         </div>
+
         <div className="hud-row">
           <button type="button" className="hud-btn" onClick={() => sceneRef.current?.zoomIn()} aria-label="Zoom in">
             +
@@ -174,3 +333,4 @@ export default function JarvisOrb() {
     </>
   );
 }
+
